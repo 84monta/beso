@@ -8,7 +8,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
-import time
+import time  # explicitly import time module
 import beso_lib
 import beso_filters
 import beso_plots
@@ -16,7 +16,158 @@ import beso_separate
 # import importlib
 # importlib.reload(beso_plots)  # reloads without FreeCAD restart
 plt.close("all")
-start_time = time.time()
+script_start_time = time.time() # Renamed from start_time to avoid conflict
+
+# --- Debug Time Measurement Setup ---
+debug_mode = False # Default value for script scope before config read
+use_vectorized_filters = False # Default value for script scope before config read
+use_kdtree = False # Default value - controls whether to use KDTree for spatial search
+
+# モジュールレベルの変数でタイミングデータを管理
+timing_data = {}  # イテレーションごとの時間データ {iter1: {step1: duration, step2: duration}, iter2: {...}}
+total_timing = {}  # 各ステップの合計時間 {step1: total_duration, step2: total_duration}
+current_iteration = None  # 現在処理中のイテレーション
+
+def log_time(step_name, start_t, debug_flag, iteration=None):
+    """ステップの実行時間をログに記録（debug_flagがTrueの場合）"""
+    global timing_data, total_timing, current_iteration
+    import beso_lib # <<< 追加
+    import time as time_module  # ローカルインポート
+    end_t = time_module.time()
+    duration = end_t - start_t
+    
+    # 常に時間データを記録（デバッグOFF時も実行時間を返す）
+    if iteration is not None:
+        current_iteration = iteration
+        if iteration not in timing_data:
+            timing_data[iteration] = {}
+        timing_data[iteration][step_name] = duration
+    
+    # 合計時間も更新
+    if step_name not in total_timing:
+        total_timing[step_name] = 0
+    total_timing[step_name] += duration
+    
+    # デバッグOFFの場合、ログ出力せずに終了
+    if not debug_flag:
+        return end_t
+    
+    # ログメッセージの作成
+    if iteration is not None:
+        log_prefix = f"[DEBUG][Iter {iteration}]"
+    else:
+        log_prefix = "[DEBUG]"
+    
+    msg = f"{log_prefix} Step '{step_name}' took: {duration:.4f} sec\n"
+    
+    # デバッグログ出力（両方の場所に確実に出力する）
+    print(msg.strip())  # 標準出力にも表示して確認しやすくする
+    
+    # ログファイルに書き込み
+    global file_name
+    try:
+        # ログファイルパスが正しく設定されているか確認
+        if not file_name or not isinstance(file_name, str):
+            raise ValueError(f"Invalid file_name: {file_name}")
+            
+        beso_lib.write_to_log(file_name, msg)
+    except (NameError, TypeError, ValueError) as e:
+        # ログファイル名が利用できない場合は標準出力に表示
+        print(f"Log file name error during log_time: {e}\nMessage: {msg}")
+    except Exception as e:
+        # write_to_log内で捕捉されなかった、あるいは他の予期せぬエラー
+        print(f"Failed to write log via log_time: {e}\nMessage: {msg}")
+    
+    return end_t
+
+def log_iteration_summary(iteration, debug_flag):
+    """イテレーションの時間サマリーをログに出力"""
+    global timing_data
+    import beso_lib # <<< 追加
+    
+    if not debug_flag or iteration not in timing_data:
+        return
+    
+    total_iter_time = sum(timing_data[iteration].values())
+    
+    msg = f"\n[DEBUG] === Iteration {iteration} Time Summary ===\n"
+    for step, duration in sorted(timing_data[iteration].items()):
+        percentage = (duration / total_iter_time) * 100
+        msg += f"[DEBUG] - {step}: {duration:.4f} sec ({percentage:.1f}%)\n"
+    msg += f"[DEBUG] Total iteration time: {total_iter_time:.4f} sec\n"
+    
+    # 標準出力にも時間情報を表示（より視認性を高めるため）
+    print(msg)
+    
+    global file_name
+    try:
+        # ログファイルパスが正しく設定されているか確認
+        if not file_name or not isinstance(file_name, str):
+            raise ValueError(f"Invalid file_name: {file_name}")
+            
+        beso_lib.write_to_log(file_name, msg)
+    except (NameError, TypeError, ValueError) as e:
+        print(f"Log file name error during log_iteration_summary: {e}")
+    except Exception as e:
+        print(f"Failed to write log via log_iteration_summary: {e}")
+
+def log_total_summary(debug_flag):
+    """全イテレーションの時間サマリーをログに出力"""
+    global timing_data, total_timing
+    import beso_lib # <<< 追加
+    
+    if not debug_flag:
+        return
+    
+    total_time = sum(total_timing.values())
+    if total_time == 0:
+        return  # 時間データがない場合は何もしない
+    
+    # 性能サマリーの作成（トップ5の時間を要したステップを強調表示）
+    msg = f"\n[DEBUG] ====== Performance Summary ======\n"
+    msg += f"[DEBUG] Total Iterations: {len(timing_data)}\n"
+    msg += f"[DEBUG] Step-by-Step Breakdown:\n"
+    
+    # 時間の降順でソート
+    sorted_timings = sorted(total_timing.items(), key=lambda x: x[1], reverse=True)
+    
+    for step, duration in sorted_timings:
+        percentage = (duration / total_time) * 100
+        if percentage > 10:  # 10%以上のステップは重要とマーク
+            msg += f"[DEBUG] - {step}: {duration:.4f} sec ({percentage:.1f}%) [SIGNIFICANT]\n"
+        else:
+            msg += f"[DEBUG] - {step}: {duration:.4f} sec ({percentage:.1f}%)\n"
+    
+    msg += f"[DEBUG] =================================\n"
+    
+    # 性能改善のヒント
+    msg += f"[DEBUG] Performance Optimization Hints:\n"
+    for step, duration in sorted_timings[:3]:  # トップ3の時間がかかるステップ
+        if "Filtering" in step and duration > 10:
+            msg += f"[DEBUG] - Consider enabling use_vectorized_filters and use_kdtree for better filtering performance\n"
+        elif "CalculiX Execution" in step and duration > 60:
+            msg += f"[DEBUG] - Consider increasing cpu_cores for faster FEA calculations\n"
+    
+    if len(timing_data) > 50:
+        msg += f"[DEBUG] - Large number of iterations ({len(timing_data)}). Consider adjusting mass_addition_ratio and mass_removal_ratio for faster convergence\n"
+    
+    # 標準出力とログファイルに出力
+    print(msg)
+    
+    global file_name
+    try:
+        # ログファイルパスが正しく設定されているか確認
+        if not file_name or not isinstance(file_name, str):
+            raise ValueError(f"Invalid file_name: {file_name}")
+            
+        beso_lib.write_to_log(file_name, msg)
+    except (NameError, TypeError, ValueError) as e:
+        print(f"Log file name error during log_total_summary: {e}")
+    except Exception as e:
+        print(f"Failed to write log via log_total_summary: {e}")
+
+# --- End Debug Time Measurement Setup ---
+
 
 # initialization of variables - default values
 domain_optimized = {}
@@ -62,7 +213,27 @@ except OSError:
 beso_dir = os.path.dirname(resolved_besofile)
 
 # read configuration file to fill variables listed above
+t_start = time.time()
 exec(open(os.path.join(beso_dir, "beso_conf.py")).read())
+# 設定情報をログに記録（デバッグモードの状態に関わらず出力）
+print(f"DEBUG MODE: {'ENABLED' if debug_mode else 'DISABLED'}")
+msg = "\n"
+msg += f"debug_mode              = {debug_mode}\n" # debug_modeの状態をログに出力
+msg += f"use_vectorized_filters  = {use_vectorized_filters}\n"
+msg += f"use_kdtree              = {use_kdtree}\n"
+# beso_lib.write_to_log(file_name, msg) # 設定情報は後でまとめて出力するため、ここではコメントアウト
+
+# デバッグモードが有効な場合、追加の詳細情報をログに記録
+if debug_mode:
+    print(f"DEBUG MODE ENABLED. Detailed timing information will be logged.")
+    # msg = "\n[DEBUG] Performance optimization settings:\n" # このログは後でまとめて出力
+    # msg += f"[DEBUG] - use_vectorized_filters: {use_vectorized_filters}\n"
+    # msg += f"[DEBUG] - use_kdtree: {use_kdtree}\n"
+    # msg += f"[DEBUG] - cpu_cores: {cpu_cores}\n"
+    # beso_lib.write_to_log(file_name, msg)
+
+t_start = log_time("Config Reading", t_start, debug_mode)
+
 
 # if available, set the input file according to the first
 # cmdline argument given to the script.
@@ -111,11 +282,15 @@ if cpu_cores == 0:  # use all processor cores
     cpu_cores = multiprocessing.cpu_count()
 os.putenv('OMP_NUM_THREADS', str(cpu_cores))
 
-# writing log file with settings
+# writing log file with settings (Keep this section as is, timing starts after this)
 msg = "\n"
 msg += "---------------------------------------------------\n"
 msg += ("file_name = %s\n" % file_name)
 msg += ("Start at    " + time.ctime() + "\n\n")
+# デバッグモードと最適化オプションの状態をログに追加
+msg += f"debug_mode              = {debug_mode}\n"
+msg += f"use_vectorized_filters  = {use_vectorized_filters}\n"
+msg += f"use_kdtree              = {use_kdtree}\n\n"
 for dn in domain_optimized:
     msg += ("elset_name              = %s\n" % dn)
     msg += ("domain_optimized        = %s\n" % domain_optimized[dn])
@@ -152,13 +327,18 @@ msg += ("displacement_graph      = %s\n" % displacement_graph)
 msg += ("save_iteration_results  = %s\n" % save_iteration_results)
 msg += ("save_solver_files       = %s\n" % save_solver_files)
 msg += ("save_resulting_format   = %s\n" % save_resulting_format)
+msg += ("use_vectorized_filters  = %s\n" % use_vectorized_filters)
+msg += ("use_kdtree              = %s\n" % use_kdtree)
 msg += "\n"
 file_name = os.path.join(path, file_name)
 beso_lib.write_to_log(file_name, msg)
+t_init_start = time.time() # Start timing after initial log write
 
 # mesh and domains importing
+t_start = time.time()
 [nodes, Elements, domains, opt_domains, en_all, plane_strain, plane_stress, axisymmetry] = beso_lib.import_inp(
     file_name, domains_from_config, domain_optimized, shells_as_composite)
+t_start = log_time("Mesh Importing", t_start, debug_mode)
 domain_shells = {}
 domain_volumes = {}
 for dn in domains_from_config:  # distinguishing shell elements and volume elements
@@ -169,6 +349,7 @@ for dn in domains_from_config:  # distinguishing shell elements and volume eleme
                                                        list(Elements.penta6.keys()) + list(Elements.penta15.keys()))
 
 # initialize element states
+t_start = time.time()
 elm_states = {}
 if isinstance(continue_from, int):
     for dn in domains_from_config:
@@ -191,9 +372,12 @@ else:
     for dn in domains_from_config:
         for en in domains[dn]:
             elm_states[en] = len(domain_density[dn]) - 1  # set to highest state
+t_start = log_time("Element State Initialization", t_start, debug_mode)
 
 # computing volume or area, and centre of gravity of each element
+t_start = time.time()
 [cg, cg_min, cg_max, volume_elm, area_elm] = beso_lib.elm_volume_cg(file_name, nodes, Elements)
+t_start = log_time("Volume/CG Calculation", t_start, debug_mode)
 mass = [0.0]
 mass_full = 0  # sum from initial states TODO make it independent on starting elm_states?
 
@@ -230,6 +414,7 @@ if iterations_limit == "auto":  # automatic setting
     beso_lib.write_to_log(file_name, msg)
 
 # preparing parameters for filtering sensitivity numbers
+t_start = time.time()
 weight_factor2 = {}
 near_elm = {}
 weight_factor3 = []
@@ -267,7 +452,7 @@ for ft in filter_list:
                 msg = "Filtered average element size is {}, filter range set automatically to {}".format(size_avg,
                                                                                                          f_range)
                 print(msg)
-                beso_lib.write_to_log(file_name, msg)
+                beso_lib.write_to_log(file_name, msg + "\n") # <<< Add newline here
             [above_elm, below_elm] = beso_filters.prepare2s_casting(cg, f_range, domains_to_filter,
                                                                     above_elm, below_elm, casting_vector)
             continue  # to evaluate other filters
@@ -287,7 +472,7 @@ for ft in filter_list:
             f_range = size_avg * 2
             msg = "Filtered average element size is {}, filter range set automatically to {}".format(size_avg, f_range)
             print(msg)
-            beso_lib.write_to_log(file_name, msg)
+            beso_lib.write_to_log(file_name, msg + "\n") # <<< Add newline here
         if ft[0] == "over points":
             beso_filters.check_same_state(domain_same_state, domains_from_config, file_name)
             [w_f3, n_e3, n_p] = beso_filters.prepare3_tetra_grid(file_name, cg, f_range, domains_to_filter)
@@ -302,14 +487,32 @@ for ft in filter_list:
             weight_factor_distance.append(w_f_d)
             near_nodes.append(n_n)
         elif ft[0] == "simple":
-            [weight_factor2, near_elm] = beso_filters.prepare2s(cg, cg_min, cg_max, f_range, domains_to_filter,
-                                                                weight_factor2, near_elm)
+            if use_kdtree:
+                # Use KDTree-based implementation for better performance
+                if debug_mode:
+                    msg = f"[DEBUG] Using KDTree for spatial search with filter range: {f_range}\n"
+                    beso_lib.write_to_log(file_name, msg)
+                [weight_factor2, near_elm] = beso_filters.prepare2s_kdtree(cg, cg_min, cg_max, f_range, domains_to_filter,
+                                                                          weight_factor2, near_elm)
+            else:
+                # Use original implementation
+                if debug_mode:
+                    msg = f"[DEBUG] Using standard sectoring for spatial search with filter range: {f_range}\n"
+                    beso_lib.write_to_log(file_name, msg)
+                [weight_factor2, near_elm] = beso_filters.prepare2s(cg, cg_min, cg_max, f_range, domains_to_filter,
+                                                                   weight_factor2, near_elm)
         elif ft[0].split()[0] in ["erode", "dilate", "open", "close", "open-close", "close-open", "combine"]:
             near_elm = beso_filters.prepare_morphology(cg, cg_min, cg_max, f_range, domains_to_filter, near_elm)
+t_start = log_time("Filter Preparation", t_start, debug_mode)
 
 # separating elements for reading nodal input
 if reference_points == "nodes":
+    t_start = time.time()
     beso_separate.separating(file_name, nodes)
+    t_start = log_time("Node Separation", t_start, debug_mode)
+
+# Log total initialization time
+log_time("Total Initialization", t_init_start, debug_mode)
 
 # writing log table header
 msg = "\n"
@@ -373,18 +576,25 @@ elm_states_last = elm_states
 oscillations = False
 
 while True:
+    t_iter_start = time.time() # Start timing for the iteration
+
     # creating the new .inp file for CalculiX
+    t_start = time.time()
     file_nameW = os.path.join(path, "file" + str(i).zfill(3))
     beso_lib.write_inp(file_name, file_nameW, elm_states, number_of_states, domains, domains_from_config,
                        domain_optimized, domain_thickness, domain_offset, domain_orientation, domain_material,
                        domain_volumes, domain_shells, plane_strain, plane_stress, axisymmetry, save_iteration_results,
                        i, reference_points, shells_as_composite, optimization_base, displacement_graph,
                        domain_FI_filled)
+    t_start = log_time("Write INP", t_start, debug_mode, iteration=i)
+
     # running CalculiX analysis
+    t_start = time.time()
     if sys.platform.startswith('linux') or sys.platform.startswith('darwin'):
         exit_status = subprocess.call([os.path.normpath(path_calculix), file_nameW], cwd=path)
     else:
         exit_status = subprocess.call([os.path.normpath(path_calculix), file_nameW], cwd=path, shell=True)
+    t_start = log_time("CalculiX Execution", t_start, debug_mode, iteration=i)
     # check CalculiX exit status
     if exit_status == 201:
         msg = "ERROR: CalculiX exit status 201. It cannot open inp file.\n"
@@ -400,6 +610,7 @@ while True:
         beso_lib.write_to_log(file_name, msg)
 
     # reading results and computing failure indices
+    t_start = time.time()
     if (reference_points == "integration points") or (optimization_base == "stiffness") or \
             (optimization_base == "buckling") or (optimization_base == "heat"):  # from .dat file
         [FI_step, energy_density_step, disp_i, buckling_factors, energy_density_eigen, heat_flux] = \
@@ -409,6 +620,7 @@ while True:
         FI_step = beso_lib.import_FI_node(reference_value, file_nameW, domains, criteria, domain_FI, file_name,
                                           elm_states, steps_superposition)
         disp_i = beso_lib.import_displacement(file_nameW, displacement_graph, steps_superposition)
+    t_start = log_time("Result Import/FI Calc", t_start, debug_mode, iteration=i)
     disp_max.append(disp_i)
 
     # check if results were found
@@ -446,7 +658,8 @@ while True:
                         raise Exception(msg)
         print("FI_max, number of violated elements, domain name")
 
-    # handling with more steps
+    # handling with more steps (Sensitivity Calculation part)
+    t_start = time.time()
     FI_step_max = {}  # maximal FI over all steps for each element in this iteration
     energy_density_enlist = {}   # {en1: [energy from sn1, energy from sn2, ...], en2: [], ...}
     FI_violated.append([])
@@ -499,8 +712,11 @@ while True:
                 sensitivity_number[en] = energy_density_eigen[1][en] / denominator[0]
                 for bfn in bf_dif:
                     sensitivity_number[en] += energy_density_eigen[bfn + 1][en] / denominator[bfn] * bf_coef[bfn]
+    t_start = log_time("Sensitivity Calculation", t_start, debug_mode, iteration=i)
 
     # filtering sensitivity number
+    t_start = time.time()
+    # filter_start_time = time.time() # Original timing, replaced by t_start
     kp = 0
     kn = 0
     for ft in filter_list:
@@ -531,12 +747,13 @@ while True:
                                                        domains_to_filter)
                 kn += 1
             elif ft[0] == "simple":
+                # Pass use_vectorized_filters and debug_mode flags to run2
                 sensitivity_number = beso_filters.run2(file_name, sensitivity_number, weight_factor2, near_elm,
-                                                       domains_to_filter)
+                                                       domains_to_filter, use_vectorized_filters, debug_mode)
             elif ft[0].split()[0] in ["erode", "dilate", "open", "close", "open-close", "close-open", "combine"]:
                 if ft[0].split()[1] == "sensitivity":
                     sensitivity_number = beso_filters.run_morphology(sensitivity_number, near_elm, domains_to_filter,
-                                                                     ft[0].split()[0])
+                                                                      ft[0].split()[0])
 
     if sensitivity_averaging:
         for en in opt_domains:
@@ -544,8 +761,17 @@ while True:
             if i > 0:
                 sensitivity_number[en] = (sensitivity_number[en] + sensitivity_number_old[en]) / 2.0
             sensitivity_number_old[en] = sensitivity_number[en]  # for averaging in the next step
+    t_start = log_time("Sensitivity Filtering", t_start, debug_mode, iteration=i)
+
+    # Time measurement for filtering process (Original print/log replaced by log_time)
+    # filter_end_time = time.time()
+    # filter_duration = filter_end_time - filter_start_time
+    # print(f"Filtering processing time: {filter_duration:.4f} sec")
+    # msg = f"Filtering processing time: {filter_duration:.4f} sec\n"
+    # beso_lib.write_to_log(file_name, msg)
 
     # computing mean stress from maximums of each element in all steps in the optimization domain
+    t_start = time.time()
     if domain_FI_filled:
         FI_mean_sum = 0
         FI_mean_sum_without_state0 = 0
@@ -598,6 +824,7 @@ while True:
         for bf in buckling_factors:
             print("buckling factor K{} = {}".format(k, bf))
             k += 1
+    t_start = log_time("Mean Value Calculation", t_start, debug_mode, iteration=i)
     # writing log table row
     msg = str(i).rjust(4, " ") + " " + str(mass[i]).rjust(17, " ") + " "
     if optimization_base == "stiffness":
@@ -627,13 +854,20 @@ while True:
     beso_lib.write_to_log(file_name, msg)
 
     # export element values
+    t_start_export = time.time()
+    export_done = False
     if save_iteration_results and np.mod(float(i), save_iteration_results) == 0:
+        export_done = True
         if "csv" in save_resulting_format:
             beso_lib.export_csv(domains_from_config, domains, criteria, FI_step, FI_step_max, file_nameW, cg,
                                 elm_states, sensitivity_number)
         if "vtk" in save_resulting_format:
             beso_lib.export_vtk(file_nameW, nodes, Elements, elm_states, sensitivity_number, criteria, FI_step,
                                 FI_step_max)
+    if export_done:
+        t_start = log_time("Result Export (CSV/VTK)", t_start_export, debug_mode, iteration=i)
+    else:
+        t_start = t_start_export # Keep t_start if no export happened
 
     # relative difference in a mean stress for the last 5 iterations must be < tolerance
     if len(FI_mean) > 5:
@@ -664,18 +898,25 @@ while True:
 
     # finish or start new iteration
     if continue_iterations is False or i >= iterations_limit:
+        t_start_export = time.time()
+        export_done = False
         if not(save_iteration_results and np.mod(float(i), save_iteration_results) == 0):
+            export_done = True
             if "csv" in save_resulting_format:
                 beso_lib.export_csv(domains_from_config, domains, criteria, FI_step, FI_step_max, file_nameW, cg,
                                     elm_states, sensitivity_number)
             if "vtk" in save_resulting_format:
                 beso_lib.export_vtk(file_nameW, nodes, Elements, elm_states, sensitivity_number, criteria, FI_step,
                                     FI_step_max)
+        if export_done:
+             log_time("Final Result Export (CSV/VTK)", t_start_export, debug_mode, iteration=i) # Log time if export happened
         break
     # plot and save figures
+    t_start = time.time()
     beso_plots.replot(path, i, oscillations, mass, domain_FI_filled, domains_from_config, FI_violated, FI_mean,
                       FI_mean_without_state0, FI_max, optimization_base, energy_density_mean, heat_flux_mean,
                       displacement_graph, disp_max, buckling_factors_all, savefig=True)
+    t_start = log_time("Plotting", t_start, debug_mode, iteration=i)
     i += 1  # iteration number
     print("\n----------- new iteration number %d ----------" % i)
 
@@ -710,6 +951,7 @@ while True:
             mass_goal_i = mass_goal_ratio * mass_full
 
     # switch element states
+    t_start = time.time()
     if ratio_type == "absolute":
         mass_referential = mass_full
     elif ratio_type == "relative":
@@ -719,8 +961,11 @@ while True:
                                             sensitivity_number, mass, mass_referential, mass_addition_ratio,
                                             mass_removal_ratio, compensate_state_filter, mass_excess, decay_coefficient,
                                             FI_violated, i_violated, i, mass_goal_i, domain_same_state)
+    t_start = log_time("Element Switching", t_start, debug_mode, iteration=i)
 
     # filtering state
+    t_start = time.time()
+    state_filter_done = False
     mass_not_filtered = mass[i]  # use variable to store the "right" mass
     for ft in filter_list:
         if ft[0] and ft[1]:
@@ -735,6 +980,7 @@ while True:
 
             if ft[0].split()[0] in ["erode", "dilate", "open", "close", "open-close", "close-open", "combine"]:
                 if ft[0].split()[1] == "state":
+                    state_filter_done = True
                     # the same filter as for sensitivity numbers
                     elm_states_filtered = beso_filters.run_morphology(elm_states, near_elm, domains_to_filter,
                                                                       ft[0].split()[0], FI_step_max)
@@ -753,18 +999,32 @@ while True:
                                     mass[i] += volume_elm[en] * (
                                         domain_density[dn][elm_states_filtered[en]] - domain_density[dn][elm_states[en]])
                                     elm_states[en] = elm_states_filtered[en]
+    if state_filter_done:
+        t_start = log_time("State Filtering", t_start, debug_mode, iteration=i)
+    else:
+        t_start = t_start # Keep t_start if no filtering happened
     print("mass = {}" .format(mass[i]))
     mass_excess = mass[i] - mass_not_filtered
 
-    # export the present mesh
+    # export the present mesh (VTK state append)
+    t_start = time.time()
     beso_lib.append_vtk_states(file_name_resulting_states, i, en_all_vtk, elm_states)
+    t_start = log_time("Append VTK States", t_start, debug_mode, iteration=i)
 
+
+    t_start_export = time.time()
+    export_done = False
     file_nameW2 = os.path.join(path, "file" + str(i).zfill(3))
     if save_iteration_results and np.mod(float(i), save_iteration_results) == 0:
+        export_done = True
         if "frd" in save_resulting_format:
             beso_lib.export_frd(file_nameW2, nodes, Elements, elm_states, number_of_states)
         if "inp" in save_resulting_format:
             beso_lib.export_inp(file_nameW2, nodes, Elements, elm_states, number_of_states)
+    if export_done:
+        t_start = log_time("Iteration Result Export (FRD/INP)", t_start_export, debug_mode, iteration=i)
+    else:
+        t_start = t_start_export # Keep t_start if no export happened
 
     # check for oscillation state
     if elm_states_before_last == elm_states:  # oscillating state
@@ -803,15 +1063,28 @@ while True:
             os.remove(file_nameW + ".12d")
         except FileNotFoundError:
             pass
+    log_time("Iteration Cleanup", t_start, debug_mode, iteration=i-1) # Log cleanup time for previous iteration files
 
-# export the resulting mesh
+    # Log total time for the iteration and output iteration summary
+    log_time("Total Iteration", t_iter_start, debug_mode, iteration=i-1) # Log total time for the completed iteration i-1
+    
+    # イテレーションごとの時間サマリーを出力
+    log_iteration_summary(i-1, debug_mode)
+
+# export the resulting mesh (Final export after loop)
+t_start_export = time.time()
+export_done = False
 if not (save_iteration_results and np.mod(float(i), save_iteration_results) == 0):
+    export_done = True
     if "frd" in save_resulting_format:
         beso_lib.export_frd(file_nameW, nodes, Elements, elm_states, number_of_states)
     if "inp" in save_resulting_format:
         beso_lib.export_inp(file_nameW, nodes, Elements, elm_states, number_of_states)
+if export_done:
+    log_time("Final Mesh Export (FRD/INP)", t_start_export, debug_mode) # Log time if export happened
 
-# removing solver files
+# removing solver files (Final cleanup)
+t_start = time.time()
 if "inp" not in save_solver_files:
     os.remove(file_nameW + ".inp")
     if reference_points == "nodes":
@@ -829,13 +1102,20 @@ if "12d" not in save_solver_files:
         os.remove(file_nameW + ".12d")
     except FileNotFoundError:
         pass
+log_time("Final Cleanup", t_start, debug_mode)
 
-# plot and save figures
+# plot and save figures (Final plot)
+t_start = time.time()
 beso_plots.replot(path, i, oscillations, mass, domain_FI_filled, domains_from_config, FI_violated, FI_mean,
                   FI_mean_without_state0, FI_max, optimization_base, energy_density_mean, heat_flux_mean,
                   displacement_graph, disp_max, buckling_factors_all, savefig=True,)
+log_time("Final Plotting", t_start, debug_mode)
+
+# 全イテレーションの性能サマリーをログに出力
+log_total_summary(debug_mode)
+
 # print total time
-total_time = time.time() - start_time
+total_time = time.time() - script_start_time # Use script_start_time for overall duration
 total_time_h = int(total_time / 3600.0)
 total_time_min = int((total_time % 3600) / 60.0)
 total_time_s = int(round(total_time % 60))
@@ -845,3 +1125,21 @@ msg += ("Total time   " + str(total_time_h) + " h " + str(total_time_min) + " mi
 msg += "\n"
 beso_lib.write_to_log(file_name, msg)
 print("total time: " + str(total_time_h) + " h " + str(total_time_min) + " min " + str(total_time_s) + " s")
+
+# デバッグモードが有効な場合、性能改善のヒントを表示
+if debug_mode:
+    msg = "\n[DEBUG] Performance Optimization Hints:\n"
+    
+    # ステップごとの最適化ヒント
+    for step, duration in sorted(total_timing.items(), key=lambda x: x[1], reverse=True):
+        if "Filtering" in step and duration > 10:
+            msg += f"[DEBUG] - Consider enabling use_vectorized_filters and use_kdtree for better filtering performance\n"
+        elif "CalculiX Execution" in step and duration > 60:
+            msg += f"[DEBUG] - Consider increasing cpu_cores for faster FEA calculations\n"
+    
+    # イテレーション回数に関するヒント
+    if len(timing_data) > 50:
+        msg += f"[DEBUG] - Large number of iterations ({len(timing_data)}). Consider adjusting mass_addition_ratio and mass_removal_ratio for faster convergence\n"
+    
+    # 結果の出力
+    beso_lib.write_to_log(file_name, msg)

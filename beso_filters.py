@@ -1,5 +1,13 @@
 import numpy as np
 import beso_lib
+import time # Import time module for vectorized timing
+from scipy.spatial import KDTree  # Import KDTree for spatial searching
+
+# Control flag for using vectorized filters (removed - now passed from beso_main.py)
+# use_vectorized_filters = True
+
+# Control flag for using KDTree-based spatial search - will be passed from beso_main.py
+# use_kdtree = True
 
 def find_size_elm(Elements, nodes):
     """calculate size of elements used for automatic filter range"""
@@ -489,9 +497,72 @@ def prepare2s(cg, cg_min, cg_max, r_min, opt_domains, weight_factor2, near_elm):
     return weight_factor2, near_elm
 
 
+# Vectorized function for filtering sensitivity numbers
+def run2_vectorized(file_name, sensitivity_number, weight_factor2, near_elm, opt_domains, debug_mode):
+    """
+    Filtering with weighted average between elements using vectorization.
+    Operates faster than the original run2 function.
+    """
+    import time
+    start_time = time.time()
+    
+    sensitivity_number_filtered = sensitivity_number.copy()
+    
+    # Vectorize processing for each element
+    for en in opt_domains:
+        if not near_elm[en]:  # Skip if no nearby elements
+            continue
+            
+        # Convert sensitivity numbers and weights of nearby elements to arrays
+        neighbors = near_elm[en]
+        weights = np.array([weight_factor2[(min(en, en2), max(en, en2))] for en2 in neighbors])
+        sens_values = np.array([sensitivity_number[en2] for en2 in neighbors])
+        
+        # Calculate weighted average
+        denominator = np.sum(weights)
+        if denominator != 0:
+            sensitivity_number_filtered[en] = np.sum(weights * sens_values) / denominator
+        else:
+            msg = "\nERROR: simple filter failed due to division by 0." \
+                  "Some element has not a near element in distance <= r_min.\n"
+            print(msg)
+            beso_lib.write_to_log(file_name, msg)
+            return sensitivity_number
+    
+    end_time = time.time()
+    # デバッグモードが有効な場合のみ処理時間を出力
+    if debug_mode:
+        print(f"run2_vectorized processing time: {end_time - start_time:.4f} sec")
+    return sensitivity_number_filtered
+
+
 # function to filter sensitivity number to suppress checkerboard
 # simplified version: makes weighted average of sensitivity numbers from near elements
-def run2(file_name, sensitivity_number, weight_factor2, near_elm, opt_domains):
+def run2(file_name, sensitivity_number, weight_factor2, near_elm, opt_domains, use_vectorized, debug_mode):
+    """Filters sensitivity numbers using simple averaging over near elements."""
+    # Log which implementation is being used
+    import time as time_module
+    
+    # Use vectorized version if enabled
+    if use_vectorized:
+        # デバッグモードが有効な場合のみログ出力
+        if debug_mode:
+            try:
+                msg = f"[DEBUG] Using vectorized filter implementation for sensitivity filtering\n"
+                beso_lib.write_to_log(file_name, msg)
+            except:
+                pass
+        return run2_vectorized(file_name, sensitivity_number, weight_factor2, near_elm, opt_domains, debug_mode)
+
+    # Original (non-vectorized) implementation
+    # デバッグモードが有効な場合のみログ出力
+    if debug_mode:
+        try:
+            msg = f"[DEBUG] Using standard (non-vectorized) filter implementation for sensitivity filtering\n"
+            beso_lib.write_to_log(file_name, msg)
+        except:
+            pass
+    start_time = time.time() # Start timing for non-vectorized version
     sensitivity_number_filtered = sensitivity_number.copy()  # sensitivity number of each element after filtering
     for en in opt_domains:
         numerator = 0
@@ -507,8 +578,12 @@ def run2(file_name, sensitivity_number, weight_factor2, near_elm, opt_domains):
                   "Some element has not a near element in distance <= r_min.\n"
             print(msg)
             beso_lib.write_to_log(file_name, msg)
-            filter_on_sensitivity = 0
+            # filter_on_sensitivity = 0 # This variable seems unused
             return sensitivity_number
+    end_time = time.time()
+    # デバッグモードが有効な場合のみ処理時間を出力
+    if debug_mode:
+        print(f"run2 (non-vectorized) processing time: {end_time - start_time:.4f} sec") # Add timing print
     return sensitivity_number_filtered
 
 
@@ -770,6 +845,50 @@ def prepare_morphology(cg, cg_min, cg_max, r_min, opt_domains, near_elm):
     # print ("near elements have been associated")
     return near_elm
 
+
+# function preparing values for filtering element rho using KDTree for spatial searching
+# Much faster than the original prepare2s function for large models
+def prepare2s_kdtree(cg, cg_min, cg_max, r_min, opt_domains, weight_factor2, near_elm):
+    """
+    KDTree-based implementation for finding near elements.
+    This is much faster than the original sectoring approach in prepare2s.
+    """
+    start_time = time.time()
+    
+    # Create arrays for KDTree
+    element_indices = list(opt_domains)
+    element_positions = np.array([cg[en] for en in element_indices])
+    
+    # Create KDTree for fast spatial queries
+    kdtree = KDTree(element_positions)
+    
+    # Find pairs of points within r_min distance
+    pairs = kdtree.query_pairs(r_min)
+    
+    # Initialize near_elm for each element
+    for en in opt_domains:
+        near_elm[en] = []
+    
+    # Process the pairs
+    for i, j in pairs:
+        en1 = element_indices[i]
+        en2 = element_indices[j]
+        
+        # Calculate actual distance
+        dx = cg[en1][0] - cg[en2][0]
+        dy = cg[en1][1] - cg[en2][1]
+        dz = cg[en1][2] - cg[en2][2]
+        distance = (dx**2 + dy**2 + dz**2)**0.5
+        
+        # Store weight factors and near elements
+        ee = (min(en1, en2), max(en1, en2))
+        weight_factor2[ee] = r_min - distance
+        near_elm[en1].append(en2)
+        near_elm[en2].append(en1)
+    
+    end_time = time.time()
+    print(f"prepare2s_kdtree processing time: {end_time - start_time:.4f} sec")
+    return weight_factor2, near_elm
 
 # morphology based filtering (erode, dilate, open, close, open-close, close-open, combine)
 def run_morphology(sensitivity_number, near_elm, opt_domains, filter_type, FI_step_max=None):

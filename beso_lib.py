@@ -1,13 +1,22 @@
 import numpy as np
 import operator
 from math import *
+import sys # Add sys import for stderr
 
 
 # function to print ongoing messages to the log file
 def write_to_log(file_name, msg):
-    f_log = open(file_name[:-4] + ".log", "a")
-    f_log.write(msg)
-    f_log.close()
+    log_file_path = file_name[:-4] + ".log"
+    try:
+        # Use 'with' statement for automatic file closing
+        with open(log_file_path, "a", encoding='utf-8') as f_log: # Specify encoding
+            f_log.write(msg)
+    except (IOError, OSError, PermissionError) as e:
+        # Print error to standard error if writing fails
+        print(f"Error writing to log file {log_file_path}: {e}", file=sys.stderr)
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"Unexpected error writing to log file {log_file_path}: {e}", file=sys.stderr)
 
 
 # function importing a mesh consisting of nodes, volume and shell elements
